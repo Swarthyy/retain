@@ -28,7 +28,7 @@ export const RANK_SCALE = [
 ]
 
 export function computeRankIndex(days: number, annualResets = 0): number {
-  if (days >= 365 && annualResets === 0) return 11
+  if (days >= 730 && annualResets === 0) return 11
   if (days >= 730) return 10
   if (days >= 365 && annualResets <= 2) return 9
   if (days >= 365) return 8

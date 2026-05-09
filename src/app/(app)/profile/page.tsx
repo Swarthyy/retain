@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
+import { createCircle, getSessionProfile, joinCircle } from '@/lib/app-data'
 import {
   getCurrentDays, rankTitle, MILESTONES, getLiveVolume,
   masteryRatio, masteryClass,
@@ -24,11 +25,6 @@ const RELIC_DEFS: Record<RelicType, { icon: string; name: string; desc: string; 
   iron_will:  { icon: '⬡', name: 'Iron Will',   color: '#a08040', desc: 'Survived 14 days after a lapse without falling again.' },
   transmuter: { icon: '◈', name: 'The Transmuter', color: '#C2557A', desc: '100% Mastery Ratio with at least 5 partnered events.' },
   phoenix:    { icon: '◎', name: 'The Phoenix',  color: '#D4A76A', desc: 'Fell to zero volume. Climbed back past 100 without another lapse.' },
-}
-
-function generateCircleCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  return Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
 }
 
 export default function ProfilePage() {
@@ -54,18 +50,21 @@ export default function ProfilePage() {
   const adjTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
-    const uid = localStorage.getItem('retain_user_id') || ''
-    const uname = localStorage.getItem('retain_username') || ''
-    setUserId(uid)
-    setUsername(uname)
-    load(uid)
+    getSessionProfile().then(session => {
+      const uid = session?.userId || ''
+      const uname = session?.profile?.username || ''
+      setUserId(uid)
+      setUsername(uname)
+      if (uid) load(uid)
+      else setLoading(false)
+    }).catch(() => setLoading(false))
   }, [])
 
   async function load(uid: string) {
     const [{ data: s }, { data: u }, { data: all }, { data: membership }, { data: logRows }, { data: earnedRelics }] = await Promise.all([
       supabase.from('streaks').select('streak_start,best_days,celebrated_milestones,volume_score,triumph_count,partnered_count').eq('user_id', uid).single(),
       supabase.from('users').select('created_at').eq('id', uid).single(),
-      supabase.from('streaks').select('user_id,streak_start'),
+      supabase.from('streaks').select('user_id,streak_start,users(username)'),
       supabase.from('circle_members').select('circle_id, circles(id, name, invite_code)').eq('user_id', uid).maybeSingle(),
       supabase.from('daily_log').select('log_date,day_type').eq('user_id', uid).gte('log_date', new Date(Date.now() - 365 * 86400000).toISOString().split('T')[0]),
       supabase.from('relics').select('relic_type').eq('user_id', uid),
@@ -139,7 +138,7 @@ export default function ProfilePage() {
       if (!error) {
         setRelics(prev => new Set([...prev, relic]))
         // Broadcast to circle feed
-        const username = localStorage.getItem('retain_username') || ''
+        const username = (await getSessionProfile())?.profile?.username || ''
         const { data: membership } = await supabase.from('circle_members').select('circle_id').eq('user_id', uid).maybeSingle()
         const def = RELIC_DEFS[relic]
         supabase.from('events').insert({
@@ -173,33 +172,30 @@ export default function ProfilePage() {
 
   async function handleCreateCircle() {
     setDrawerLoading(true); setDrawerError('')
-    let code = generateCircleCode()
-    const tryInsert = async (c: string) => supabase.from('circles').insert({ name: `${username}'s circle`, invite_code: c, creator_id: userId }).select('id').single()
-    let { data: circ, error } = await tryInsert(code)
-    if (error || !circ) {
-      code = generateCircleCode()
-      const r2 = await tryInsert(code)
-      if (r2.error || !r2.data) { setDrawerError('Could not create. Try again.'); setDrawerLoading(false); return }
-      circ = r2.data
+    try {
+      const circ = await createCircle()
+      setCircle(circ)
+      setCreatedCode(circ.invite_code)
+    } catch (err) {
+      setDrawerError(err instanceof Error ? err.message : 'Could not create. Try again.')
+    } finally {
+      setDrawerLoading(false)
     }
-    await supabase.from('circle_members').insert({ circle_id: circ.id, user_id: userId })
-    await supabase.from('events').insert({ user_id: userId, username, kind: 'joined_circle', body: 'created a circle.', cta: 'The brotherhood is open.', circle_id: circ.id })
-    setCircle({ id: circ.id, name: `${username}'s circle`, invite_code: code })
-    setCreatedCode(code)
-    setDrawerLoading(false)
   }
 
   async function handleJoinCircle() {
     const code = joinCode.trim().toUpperCase()
     if (code.length !== 6) { setDrawerError('Enter the 6-character code.'); return }
     setDrawerLoading(true); setDrawerError('')
-    const { data: circ } = await supabase.from('circles').select('id, name').eq('invite_code', code).maybeSingle()
-    if (!circ) { setDrawerError('No circle found.'); setDrawerLoading(false); return }
-    await supabase.from('circle_members').upsert({ circle_id: circ.id, user_id: userId }, { onConflict: 'circle_id,user_id' })
-    await supabase.from('events').insert({ user_id: userId, username, kind: 'joined_circle', body: 'joined the circle.', cta: 'The rivalry begins.', circle_id: circ.id })
-    setCircle({ id: circ.id, name: circ.name, invite_code: code })
-    setDrawerLoading(false)
-    setShowBrotherhood(false)
+    try {
+      const circ = await joinCircle(code)
+      setCircle(circ)
+      setShowBrotherhood(false)
+    } catch (err) {
+      setDrawerError(err instanceof Error ? err.message : 'No circle found.')
+    } finally {
+      setDrawerLoading(false)
+    }
   }
 
   if (loading || !streak) {
@@ -227,22 +223,32 @@ export default function ProfilePage() {
   ]
 
   return (
-    <div style={{ padding: '52px 0 24px' }}>
+    <div style={{ padding: '42px 0 24px' }}>
 
       {/* Avatar + username + class */}
-      <div style={{ padding: '4px 22px 20px', textAlign: 'center' }}>
-        <div style={{ width: 72, height: 72, borderRadius: '50%', background: 'linear-gradient(135deg,rgba(212,167,106,0.27),rgba(215,138,80,0.27))', border: '2px solid rgba(212,167,106,0.4)', margin: '0 auto 10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 30 }}>
+      <div style={{ margin: '0 20px 18px', padding: '24px 18px 18px', textAlign: 'center', borderRadius: 22, border: '1px solid rgba(212,167,106,0.18)', background: 'radial-gradient(circle at 50% 0%, rgba(212,167,106,0.20), transparent 42%), linear-gradient(180deg,rgba(239,228,207,0.06),rgba(239,228,207,0.025))', boxShadow: '0 0 36px rgba(212,167,106,0.07)' }}>
+        <div style={{ width: 84, height: 84, borderRadius: '50%', background: 'linear-gradient(135deg,rgba(212,167,106,0.36),rgba(215,138,80,0.14))', border: '2px solid rgba(212,167,106,0.48)', margin: '0 auto 12px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 34, boxShadow: '0 0 28px rgba(212,167,106,0.18)' }}>
           🧘
         </div>
-        <div style={{ fontSize: 19, color: '#EFE4CF', fontWeight: 800, letterSpacing: -0.4 }}>@{username}</div>
+        <div style={{ fontSize: 22, color: '#EFE4CF', fontWeight: 900, letterSpacing: -0.4 }}>@{username}</div>
         <div style={{ fontSize: 11, color: '#4a3322', marginTop: 3 }}>{title} · {mClass}</div>
         <div style={{ fontSize: 10, color: '#4a3322', marginTop: 1 }}>Member since {memberSince}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 18 }}>
+          <div style={{ borderRadius: 14, background: 'rgba(6,3,2,0.45)', border: '1px solid rgba(212,167,106,0.16)', padding: '10px 8px' }}>
+            <div style={{ color: '#4a3322', fontSize: 9, letterSpacing: 2, textTransform: 'uppercase' }}>Current</div>
+            <div style={{ color: '#EFE4CF', fontSize: 25, fontWeight: 900 }}>{days}<span style={{ color: '#906e50', fontSize: 11, marginLeft: 3 }}>d</span></div>
+          </div>
+          <div style={{ borderRadius: 14, background: 'rgba(212,167,106,0.08)', border: '1px solid rgba(212,167,106,0.22)', padding: '10px 8px' }}>
+            <div style={{ color: '#906e50', fontSize: 9, letterSpacing: 2, textTransform: 'uppercase' }}>All-time</div>
+            <div style={{ color: '#D4A76A', fontSize: 25, fontWeight: 900 }}>{best}<span style={{ color: '#906e50', fontSize: 11, marginLeft: 3 }}>d</span></div>
+          </div>
+        </div>
       </div>
 
       {/* Stats grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, padding: '0 20px 18px' }}>
         {stats.map(s => (
-          <div key={s.label} style={{ background: 'rgba(239,228,207,0.06)', border: '1px solid rgba(239,228,207,0.08)', borderRadius: 14, padding: '12px 14px' }}>
+          <div key={s.label} style={{ background: 'linear-gradient(180deg,rgba(239,228,207,0.065),rgba(239,228,207,0.035))', border: '1px solid rgba(239,228,207,0.09)', borderRadius: 16, padding: '13px 14px', minHeight: 86 }}>
             <div style={{ fontSize: 9, letterSpacing: 2, color: '#906e50', textTransform: 'uppercase', marginBottom: 6 }}>{s.label}</div>
             <div style={{ fontSize: 20, color: s.c, fontWeight: 800, letterSpacing: -0.3, lineHeight: 1 }}>{s.val}</div>
             <div style={{ fontSize: 10, color: '#4a3322', marginTop: 4 }}>{s.unit}</div>
@@ -251,7 +257,7 @@ export default function ProfilePage() {
       </div>
 
       {/* Mastery Ratio */}
-      <div style={{ margin: '0 20px 16px', background: 'rgba(194,85,122,0.06)', border: '1px solid rgba(194,85,122,0.15)', borderRadius: 16, padding: '14px 16px' }}>
+      <div style={{ margin: '0 20px 16px', background: 'linear-gradient(135deg,rgba(194,85,122,0.09),rgba(239,228,207,0.035))', border: '1px solid rgba(194,85,122,0.20)', borderRadius: 18, padding: 16 }}>
         <div style={{ fontSize: 10, color: '#C2557A', fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 10 }}>Mastery Ratio</div>
         {mRatio === null ? (
           <div style={{ fontSize: 13, color: '#4a3322', fontStyle: 'italic' }}>Awaiting the test.</div>
@@ -270,7 +276,7 @@ export default function ProfilePage() {
       </div>
 
       {/* Relics */}
-      <div style={{ margin: '0 20px 16px', background: 'rgba(239,228,207,0.06)', border: '1px solid rgba(239,228,207,0.08)', borderRadius: 16, padding: '14px 16px' }}>
+      <div style={{ margin: '0 20px 16px', background: 'rgba(239,228,207,0.045)', border: '1px solid rgba(239,228,207,0.09)', borderRadius: 18, padding: 16 }}>
         <div style={{ fontSize: 10, color: '#D4A76A', fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 12 }}>Relics</div>
         {Object.entries(RELIC_DEFS).map(([key, def]) => {
           const earned = relics.has(key as RelicType)
@@ -297,7 +303,7 @@ export default function ProfilePage() {
       </div>
 
       {/* Milestones */}
-      <div style={{ margin: '0 20px 16px', background: 'rgba(239,228,207,0.06)', border: '1px solid rgba(239,228,207,0.08)', borderRadius: 16, padding: 16 }}>
+      <div style={{ margin: '0 20px 16px', background: 'linear-gradient(180deg,rgba(239,228,207,0.055),rgba(239,228,207,0.03))', border: '1px solid rgba(239,228,207,0.09)', borderRadius: 18, padding: 16 }}>
         <div style={{ fontSize: 10, color: '#D4A76A', fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', marginBottom: 14 }}>Milestone Progress</div>
         {MILESTONES.map(m => {
           const pct = Math.min(100, (best / m) * 100)
@@ -320,8 +326,14 @@ export default function ProfilePage() {
       </div>
 
       {/* Heatmap */}
-      <div style={{ margin: '0 20px 16px', background: 'rgba(239,228,207,0.06)', border: '1px solid rgba(239,228,207,0.08)', borderRadius: 16, padding: '14px 16px' }}>
-        <div style={{ fontSize: 13, color: '#EFE4CF', fontWeight: 600, marginBottom: 4 }}>365-Day Consistency</div>
+      <div style={{ margin: '0 20px 16px', background: 'linear-gradient(135deg,rgba(212,167,106,0.08),rgba(239,228,207,0.035))', border: '1px solid rgba(212,167,106,0.16)', borderRadius: 18, padding: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+          <div>
+            <div style={{ fontSize: 14, color: '#EFE4CF', fontWeight: 800 }}>365-Day Consistency</div>
+            <div style={{ fontSize: 10, color: '#906e50', marginTop: 2 }}>Your path, day by day</div>
+          </div>
+          <div style={{ color: '#D4A76A', fontSize: 18, fontWeight: 900 }}>{Math.min(365, days)}</div>
+        </div>
         <Heatmap streakStart={streak.streak_start} dailyLog={dailyLog} />
       </div>
 
@@ -368,7 +380,7 @@ export default function ProfilePage() {
       {/* Dev button */}
       {process.env.NODE_ENV === 'development' && (
         <div style={{ padding: '16px 20px 0' }}>
-          <button onClick={() => { localStorage.removeItem('retain_onboarded'); window.location.href = '/onboarding' }}
+          <button onClick={() => { window.location.href = '/onboarding' }}
             style={{ width: '100%', minHeight: 48, background: 'transparent', border: '1px solid rgba(212,167,106,0.2)', borderRadius: 14, color: '#906e50', fontFamily: 'var(--font-inter)', fontSize: 13, cursor: 'pointer' }}>
             ⚙ Test Onboarding Flow
           </button>
@@ -377,7 +389,7 @@ export default function ProfilePage() {
 
       {/* Sign out */}
       <div style={{ padding: '16px 20px 0' }}>
-        <button onClick={() => { localStorage.removeItem('retain_user_id'); localStorage.removeItem('retain_username'); window.location.href = '/login' }}
+        <button onClick={async () => { await supabase.auth.signOut(); localStorage.removeItem('retain_user_id'); localStorage.removeItem('retain_username'); localStorage.removeItem('retain_onboarded'); localStorage.removeItem('retain_pending_circle_code'); window.location.href = '/login' }}
           style={{ width: '100%', minHeight: 48, background: 'transparent', border: '1px solid rgba(239,228,207,0.1)', borderRadius: 14, color: '#4a3322', fontFamily: 'var(--font-inter)', fontSize: 14, cursor: 'pointer' }}>
           Sign out
         </button>

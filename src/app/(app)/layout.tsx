@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import NavBar from '@/components/NavBar'
+import { getSessionProfile } from '@/lib/app-data'
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -10,12 +11,16 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    const userId = localStorage.getItem('retain_user_id')
-    if (!userId) {
-      router.replace('/login')
-    } else {
-      setReady(true)
-    }
+    let alive = true
+    getSessionProfile()
+      .then(session => {
+        if (!alive) return
+        if (!session) router.replace('/login')
+        else if (!session.profile?.onboarded) router.replace('/onboarding')
+        else setReady(true)
+      })
+      .catch(() => router.replace('/login'))
+    return () => { alive = false }
   }, [router])
 
   if (!ready) {

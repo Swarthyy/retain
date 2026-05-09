@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
+import { getCircleLeaderboard, getFeedEvents, getMyCircle, getMyStreak, getSessionProfile, logRetentionEvent } from '@/lib/app-data'
 import {
   getCurrentDays, startDateLabel, greeting, dayWord,
   MILESTONES, MILESTONE_TITLES,
@@ -47,19 +48,15 @@ export default function TodayPage() {
   const [banners, setBanners] = useState<Banner[]>([])
   const [loading, setLoading] = useState(true)
 
-  const loadBanners = useCallback(async (uid: string, myRank: number, total: number) => {
+  const loadBanners = useCallback(async (uid: string, myRank: number, total: number, cid: string | null) => {
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
     const dismissed: string[] = JSON.parse(localStorage.getItem('retain_dismissed_banners') || '[]')
     const result: Banner[] = []
 
-    const { data: lapseEvents } = await supabase
-      .from('events')
-      .select('id,username,kind,body,user_id')
-      .eq('kind', 'lapse')
-      .gte('created_at', since)
-      .neq('user_id', uid)
-      .order('created_at', { ascending: false })
-      .limit(10)
+    const events = await getFeedEvents(cid)
+    const lapseEvents = events
+      .filter(e => e.kind === 'lapse' && e.user_id !== uid && new Date(e.created_at) >= new Date(since))
+      .slice(0, 10)
 
     const others = (lapseEvents || []).filter(e => !dismissed.includes(e.id))
     if (others.length === 1) {
@@ -80,40 +77,37 @@ export default function TodayPage() {
   }, [])
 
   const loadData = useCallback(async (uid: string) => {
-    const [{ data: s }, { data: all }, { data: membership }] = await Promise.all([
-      supabase
-        .from('streaks')
-        .select('streak_start,best_days,celebrated_milestones,volume_score,last_event_at,binge_count,triumph_count,partnered_count')
-        .eq('user_id', uid)
-        .single(),
-      supabase.from('streaks').select('user_id,streak_start'),
-      supabase.from('circle_members').select('circle_id').eq('user_id', uid).maybeSingle(),
+    const [s, circle, leaderboard] = await Promise.all([
+      getMyStreak(),
+      getMyCircle(),
+      getCircleLeaderboard('circle'),
     ])
 
     if (s) setStreak(s)
-    if (membership) setCircleId(membership.circle_id)
+    setCircleId(circle?.id ?? null)
 
     let myRank = 1, total = 1
-    if (all) {
-      const ranked = all
-        .map(r => ({ uid: r.user_id, d: getCurrentDays(r.streak_start) }))
-        .sort((a, b) => b.d - a.d)
-      myRank = ranked.findIndex(r => r.uid === uid) + 1 || 1
-      total = all.length
+    if (leaderboard.entries.length > 0) {
+      const ranked = [...leaderboard.entries].sort((a, b) => b.current - a.current)
+      myRank = ranked.findIndex(r => r.user_id === uid) + 1 || 1
+      total = ranked.length
       setRank(myRank)
       setTotalUsers(total)
       setIsCrownHolder(myRank === 1 && total > 1)
     }
     setLoading(false)
-    loadBanners(uid, myRank, total)
+    loadBanners(uid, myRank, total, circle?.id ?? null)
   }, [loadBanners])
 
   useEffect(() => {
-    const uid = localStorage.getItem('retain_user_id') || ''
-    const uname = localStorage.getItem('retain_username') || ''
-    setUserId(uid)
-    setUsername(uname)
-    if (uid) loadData(uid)
+    getSessionProfile().then(session => {
+      const uid = session?.userId || ''
+      const uname = session?.profile?.username || ''
+      setUserId(uid)
+      setUsername(uname)
+      if (uid) loadData(uid)
+      else setLoading(false)
+    }).catch(() => setLoading(false))
   }, [loadData])
 
   // Milestone detection
@@ -171,40 +165,8 @@ export default function TodayPage() {
 
   async function handleConfirmTriumph() {
     if (!userId || !streak) return
-    const days = getCurrentDays(streak.streak_start)
-    const liveVol = getLiveVolume(streak.volume_score, streak.streak_start)
-    const today = new Date().toISOString().split('T')[0]
-    const now = new Date().toISOString()
-
-    await Promise.all([
-      // Audit log
-      supabase.from('retention_events').insert({
-        user_id: userId, event_type: 'triumph',
-        volume_before: liveVol, volume_after: liveVol,
-        penalty_multiplier: 1, streak_days_at_event: days,
-      }),
-      // Daily log for heatmap
-      supabase.from('daily_log').upsert({ user_id: userId, log_date: today, day_type: 'triumph' }, { onConflict: 'user_id,log_date' }),
-      // Streak mastery counters
-      supabase.from('streaks').update({
-        triumph_count: (streak.triumph_count || 0) + 1,
-        partnered_count: (streak.partnered_count || 0) + 1,
-      }).eq('user_id', userId),
-      // Circle broadcast
-      supabase.from('events').insert({
-        user_id: userId, username,
-        kind: 'triumph',
-        body: currentTriumphMsg,
-        cta: `${days} days and the streak endures.`,
-        circle_id: circleId,
-      }),
-    ])
-
-    setStreak(s => s ? {
-      ...s,
-      triumph_count: (s.triumph_count || 0) + 1,
-      partnered_count: (s.partnered_count || 0) + 1,
-    } : s)
+    await logRetentionEvent('triumph')
+    await loadData(userId)
     setResetFlow('idle')
     setEventType(null)
   }
@@ -213,85 +175,8 @@ export default function TodayPage() {
 
   async function handleConfirmReset() {
     if (!userId || !streak || !eventType || eventType === 'triumph') return
-    const days = preResetDays
-    const liveVol = previewLiveVolume
-    const newBest = isRecord ? days : streak.best_days
-    const today = new Date().toISOString().split('T')[0]
-    const now = new Date().toISOString()
-    const multiplier = inBingeWindow(streak.last_event_at) ? Math.max(1, streak.binge_count + 1) : 1
-    const newBingeCount = inBingeWindow(streak.last_event_at) ? streak.binge_count + 1 : 1
-
-    // Check for crown transfer before resetting
-    const wasKing = isCrownHolder && totalUsers > 1
-
-    // Lapse feed body copy
-    const lapseBody = eventType === 'lapse'
-      ? `A moment of silence. ${username} lost the battle. The reservoir leaks to ${previewVolumeAfter}. The journey begins anew.`
-      : `${username} chose the mortal path tonight. The reservoir takes a hit, but respect is maintained.`
-
-    await Promise.all([
-      // Update streak
-      supabase.from('streaks').update({
-        streak_start: today,
-        best_days: newBest,
-        celebrated_milestones: [],
-        volume_score: previewVolumeAfter,
-        last_event_at: now,
-        binge_count: newBingeCount,
-        partnered_count: (streak.partnered_count || 0) + (eventType === 'conscious' ? 1 : 0),
-      }).eq('user_id', userId),
-      // Audit log
-      supabase.from('retention_events').insert({
-        user_id: userId, event_type: eventType,
-        volume_before: liveVol, volume_after: previewVolumeAfter,
-        penalty_multiplier: multiplier, streak_days_at_event: days,
-      }),
-      // Daily log for heatmap
-      supabase.from('daily_log').upsert({
-        user_id: userId, log_date: today,
-        day_type: eventType === 'lapse' ? 'lapse' : 'conscious',
-      }, { onConflict: 'user_id,log_date' }),
-      // Circle broadcast — TOTAL ACCOUNTABILITY (both lapse and conscious are public)
-      supabase.from('events').insert({
-        user_id: userId, username,
-        kind: eventType,
-        body: lapseBody,
-        cta: isRecord ? `A new longest before the fall.` : `Best remains ${newBest} days.`,
-        circle_id: circleId,
-      }),
-    ])
-
-    // Crown transfer: find new #1 after reset
-    if (wasKing) {
-      const { data: allStreaks } = await supabase.from('streaks').select('user_id,streak_start,users(username)')
-      if (allStreaks) {
-        type Row = { user_id: string; streak_start: string; users: { username: string } }
-        const sorted = (allStreaks as unknown as Row[])
-          .map(r => ({ uid: r.user_id, uname: r.users?.username || '??', d: getCurrentDays(r.streak_start) }))
-          .sort((a, b) => b.d - a.d)
-        const newKing = sorted.find(r => r.uid !== userId)
-        if (newKing && circleId) {
-          supabase.from('events').insert({
-            user_id: userId, username,
-            kind: 'crown_transfer',
-            body: `has fallen from the throne. ${newKing.uname} claims the Crown. ♛`,
-            cta: 'A new king rises.',
-            circle_id: circleId,
-          })
-        }
-      }
-    }
-
-    setStreak({
-      streak_start: today,
-      best_days: newBest,
-      celebrated_milestones: [],
-      volume_score: previewVolumeAfter,
-      last_event_at: now,
-      binge_count: newBingeCount,
-      triumph_count: streak.triumph_count || 0,
-      partnered_count: (streak.partnered_count || 0) + (eventType === 'conscious' ? 1 : 0),
-    })
+    await logRetentionEvent(eventType)
+    await loadData(userId)
     setIsCrownHolder(false)
     setResetFlow('record')
   }

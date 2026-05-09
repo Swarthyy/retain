@@ -2,12 +2,20 @@
 
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
+import { getSessionProfile } from '@/lib/app-data'
 
 export default function Home() {
   const router = useRouter()
   useEffect(() => {
-    const userId = localStorage.getItem('retain_user_id')
-    router.replace(userId ? '/today' : '/login')
+    let alive = true
+    getSessionProfile()
+      .then(session => {
+        if (!alive) return
+        if (!session) router.replace('/login')
+        else router.replace(session.profile?.onboarded ? '/today' : '/onboarding')
+      })
+      .catch(() => router.replace('/login'))
+    return () => { alive = false }
   }, [router])
 
   return (
